@@ -12,6 +12,9 @@ jobs:
     permissions:
       contents: write   # needed to push the updated files back
 
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
