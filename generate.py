@@ -7,6 +7,7 @@ stream URLs from an external M3U source to produce:
   • playlist.m3u — paired M3U playlist (channels with matched streams only)
 """
 
+import hashlib
 import re
 import time
 import unicodedata
@@ -19,6 +20,7 @@ from lxml import etree
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 M3U_SOURCE         = "https://www.apsattv.com/rakutentv-uk.m3u"
+M3U_HASH_FILE       = ".m3u_source_hash"   # tracks last-seen content hash across runs
 TIMEZONE           = pytz.timezone("Europe/London")
 DT_FORMAT          = "%Y%m%d%H%M%S %z"
 GAP_THRESHOLD_SECS = 60  # snap end-times within this many seconds of the next start
@@ -82,6 +84,33 @@ def get_epg_window():
     return now, end
 
 
+def check_m3u_freshness(text: str) -> None:
+    """
+    Compare a hash of the fetched M3U body against the hash stored from the
+    previous run (committed alongside epg.xml/playlist.m3u in the repo).
+    Logs whether apsattv's list actually changed since last run — apsattv
+    updates this list manually/irregularly, so this is just a freshness
+    signal in the Actions log, not a hard gate.
+    """
+    current_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    previous_hash = None
+    try:
+        with open(M3U_HASH_FILE, "r") as f:
+            previous_hash = f.read().strip()
+    except FileNotFoundError:
+        pass
+
+    if previous_hash is None:
+        print("  [freshness] no previous hash on record — treating as baseline")
+    elif current_hash == previous_hash:
+        print("  [freshness] M3U source UNCHANGED since last run")
+    else:
+        print("  [freshness] M3U source CHANGED since last run")
+
+    with open(M3U_HASH_FILE, "w") as f:
+        f.write(current_hash)
+
+
 # ── M3U fetching & parsing ────────────────────────────────────────────────────
 
 def fetch_m3u(url: str):
@@ -95,6 +124,7 @@ def fetch_m3u(url: str):
     """
     print(f"Fetching M3U: {url}")
     resp = fetch_with_retry(url)
+    check_m3u_freshness(resp.text)
 
     by_name = {}
     by_slug = {}
@@ -308,7 +338,9 @@ def main():
                 ch_language = langs[0].get("id")
             ch_tags = labels.get("tags")
 
-        # Match to an M3U stream entry
+        # Match to an M3U stream entry (used only for its stream URL — the
+        # apsattv tvg-id format is inconsistent across mirrors/refreshes and
+        # is NOT used as our channel identifier, see note below)
         m3u = match_m3u(ch_name, ch_id, m3u_by_name, m3u_by_slug)
 
         channels_data.append({
@@ -318,8 +350,12 @@ def main():
             "icon":       ch_icon,
             "language":   ch_language,
             "tags":       ch_tags,
-            "stream_url": m3u["url"]      if m3u else None,
-            "tvg_id":     m3u["tvg_id"]   if m3u else ch_id,
+            "stream_url": m3u["url"] if m3u else None,
+            # IMPORTANT: always use Rakuten's own slug (e.g. "mr-bean-live-action")
+            # as tvg-id, NOT the source M3U's tvg-id. epg.xml's <channel id="...">
+            # is built from this same ch_id, so playlist.m3u and epg.xml must
+            # share this value or TiviMate can't match programmes to channels.
+            "tvg_id":     ch_id,
             "tvg_logo":   m3u["tvg_logo"] if m3u else ch_icon,
             "group":      m3u["group"]    if m3u else "RakutenTV UK",
         })
