@@ -34,7 +34,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add epg.xml playlist.m3u
+          git add epg.xml playlist.m3u .m3u_source_hash
           # Only commit if something actually changed
           git diff --cached --quiet || git commit -m "chore: update EPG and playlist [$(date -u '+%Y-%m-%d %H:%M UTC')]"
           git push
