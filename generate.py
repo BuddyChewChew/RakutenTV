@@ -23,8 +23,8 @@ TIMEZONE           = pytz.timezone("Europe/London")
 DT_FORMAT          = "%Y%m%d%H%M%S %z"
 GAP_THRESHOLD_SECS = 60  # snap end-times within this many seconds of the next start
 
-RETRY_ATTEMPTS     = 3
-RETRY_BACKOFF_SECS = 15
+RETRY_ATTEMPTS     = 6
+RETRY_BACKOFF_SECS = 30
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
