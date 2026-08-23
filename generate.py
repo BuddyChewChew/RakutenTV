@@ -12,6 +12,7 @@ import re
 import time
 import unicodedata
 from datetime import datetime, timedelta, time as dt_time, timezone
+from urllib.parse import urlencode
 
 import pytz
 import requests
@@ -20,13 +21,26 @@ from lxml import etree
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 M3U_SOURCE         = "https://www.apsattv.com/rakutentv-uk.m3u"
-M3U_HASH_FILE       = ".m3u_source_hash"   # tracks last-seen content hash across runs
+M3U_HASH_FILE      = ".m3u_source_hash"   # tracks last-seen content hash across runs
 TIMEZONE           = pytz.timezone("Europe/London")
 DT_FORMAT          = "%Y%m%d%H%M%S %z"
 GAP_THRESHOLD_SECS = 60  # snap end-times within this many seconds of the next start
 
 RETRY_ATTEMPTS     = 6
 RETRY_BACKOFF_SECS = 30
+
+# Headers that real browsers / other Rakuten clients send
+API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Origin": "https://rakuten.tv",
+    "Referer": "https://rakuten.tv/",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-GB,en;q=0.9",
+}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -50,37 +64,54 @@ def to_tz_str(val) -> str:
     return dt.astimezone(TIMEZONE).strftime(DT_FORMAT)
 
 
-def fetch_with_retry(url: str, timeout: int = 30) -> requests.Response:
+def fetch_with_retry(url: str, headers: dict | None = None, timeout: int = 30) -> requests.Response:
     """
     GET a URL with automatic retry on 503 / connection errors.
-    Raises the final exception if all attempts fail.
+    On final failure (or non-retryable 4xx) logs the response body when available.
     """
     last_exc = None
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            resp = requests.get(url, timeout=timeout)
+            resp = requests.get(url, headers=headers or {}, timeout=timeout)
             if resp.status_code == 503 and attempt < RETRY_ATTEMPTS:
                 print(f"  [attempt {attempt}/{RETRY_ATTEMPTS}] 503 received, "
                       f"retrying in {RETRY_BACKOFF_SECS}s ...")
                 time.sleep(RETRY_BACKOFF_SECS)
                 continue
+            # For 4xx we usually don't want endless retries – raise immediately
+            # so the caller can try a fallback strategy.
+            if 400 <= resp.status_code < 500:
+                print(f"  HTTP {resp.status_code} body (first 500 chars): {resp.text[:500]!r}")
+                resp.raise_for_status()
             resp.raise_for_status()
             return resp
         except requests.exceptions.RequestException as exc:
             last_exc = exc
-            if attempt < RETRY_ATTEMPTS:
+            if attempt < RETRY_ATTEMPTS and not (
+                hasattr(exc, "response") and exc.response is not None
+                and 400 <= exc.response.status_code < 500
+            ):
                 print(f"  [attempt {attempt}/{RETRY_ATTEMPTS}] Request error: {exc}, "
                       f"retrying in {RETRY_BACKOFF_SECS}s ...")
                 time.sleep(RETRY_BACKOFF_SECS)
+            else:
+                # Final failure or non-retryable 4xx – stop early
+                break
     raise last_exc
 
 
 # ── EPG window ────────────────────────────────────────────────────────────────
 
-def get_epg_window():
-    """Return (start, end) datetimes for a 72-hour EPG window starting now."""
-    now = datetime.now().replace(minute=0, second=0, microsecond=0)
-    end = datetime.combine(datetime.now().date(), dt_time(0, 0)) + timedelta(days=3)
+def get_epg_window(hours: int = 72):
+    """
+    Return (start, end) timezone-aware UTC datetimes.
+    Default = roughly 72-hour window starting at the current hour.
+    """
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    # End at the next midnight that is at least `hours` away
+    end = (now + timedelta(hours=hours)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if end <= now:
+        end += timedelta(days=1)
     return now, end
 
 
@@ -283,37 +314,81 @@ def build_m3u(channels: list) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ── API helpers with fallbacks ────────────────────────────────────────────────
+
+def build_api_url(epg_start: datetime, epg_end: datetime, include_timestamps: bool = True) -> str:
+    """Build the live_channels query URL."""
+    params = {
+        "classification_id": "18",
+        "device_identifier": "web",
+        "device_stream_audio_quality": "2.0",
+        "device_stream_hdr_type": "NONE",
+        "device_stream_video_quality": "FHD",
+        "epg_duration_minutes": "360",
+        "epg_ends_at": epg_end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "epg_starts_at": epg_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "locale": "en",
+        "market_code": "uk",
+        "per_page": "250",
+    }
+    if include_timestamps:
+        # Critical fix: send integers, not floats like 1787518800.0
+        params["epg_ends_at_timestamp"] = str(int(epg_end.timestamp()))
+        params["epg_starts_at_timestamp"] = str(int(epg_start.timestamp()))
+
+    return "https://gizmo.rakuten.tv/v3/live_channels?" + urlencode(params)
+
+
+def fetch_epg_data() -> list:
+    """
+    Try several strategies to obtain the live_channels payload.
+    Returns the list under data["data"].
+    """
+    strategies = [
+        # 1. Full 72 h window + timestamps (the normal case)
+        {"hours": 72, "timestamps": True,  "label": "72h + timestamps"},
+        # 2. Same window but omit the _timestamp parameters
+        {"hours": 72, "timestamps": False, "label": "72h (dates only)"},
+        # 3. Shorter window
+        {"hours": 48, "timestamps": True,  "label": "48h + timestamps"},
+        # 4. Even shorter + no timestamps
+        {"hours": 24, "timestamps": False, "label": "24h (dates only)"},
+    ]
+
+    last_exc = None
+    for strat in strategies:
+        epg_start, epg_end = get_epg_window(hours=strat["hours"])
+        api_url = build_api_url(epg_start, epg_end, include_timestamps=strat["timestamps"])
+        print(f"\nTrying strategy: {strat['label']}")
+        print(f"  window: {epg_start.isoformat()} → {epg_end.isoformat()}")
+        try:
+            resp = fetch_with_retry(api_url, headers=API_HEADERS)
+            data = resp.json().get("data")
+            if not data:
+                raise ValueError("API returned empty 'data' array")
+            print(f"  ✓ Success — retrieved {len(data)} channels")
+            return data
+        except Exception as exc:
+            last_exc = exc
+            print(f"  ✗ Failed: {exc}")
+            continue
+
+    # All strategies exhausted
+    raise RuntimeError(
+        "All EPG fetch strategies failed. Last error: " + str(last_exc)
+    ) from last_exc
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     # 1. Fetch & parse M3U stream source
     m3u_by_name, m3u_by_slug = fetch_m3u(M3U_SOURCE)
 
-    # 2. Build Rakuten EPG API URL
-    epg_start, epg_end = get_epg_window()
-
-    params = (
-        "classification_id=18"
-        "&device_identifier=web"
-        "&device_stream_audio_quality=2.0"
-        "&device_stream_hdr_type=NONE"
-        "&device_stream_video_quality=FHD"
-        "&epg_duration_minutes=360"
-        f"&epg_ends_at={epg_end.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-        f"&epg_ends_at_timestamp={epg_end.timestamp()}"
-        f"&epg_starts_at={epg_start.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-        f"&epg_starts_at_timestamp={epg_start.timestamp()}"
-        "&locale=en"
-        "&market_code=uk"
-        "&per_page=250"
-    )
-    api_url = "https://gizmo.rakuten.tv/v3/live_channels?" + params.replace(":", "%3A")
-
+    # 2. Fetch EPG data (with fallbacks)
     print("\nFetching EPG data from Rakuten API ...")
-    resp = fetch_with_retry(api_url)
-
-    data = resp.json()["data"]
-    print(f"Retrieved {len(data)} channels\n")
+    data = fetch_epg_data()
+    print(f"\nRetrieved {len(data)} channels\n")
 
     channels_data  = []
     programme_data = []
