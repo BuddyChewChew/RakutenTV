@@ -11,7 +11,7 @@ import hashlib
 import re
 import time
 import unicodedata
-from datetime import datetime, timedelta, time as dt_time, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import pytz
@@ -21,15 +21,14 @@ from lxml import etree
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 M3U_SOURCE         = "https://www.apsattv.com/rakutentv-uk.m3u"
-M3U_HASH_FILE      = ".m3u_source_hash"   # tracks last-seen content hash across runs
+M3U_HASH_FILE      = ".m3u_source_hash"
 TIMEZONE           = pytz.timezone("Europe/London")
 DT_FORMAT          = "%Y%m%d%H%M%S %z"
-GAP_THRESHOLD_SECS = 60  # snap end-times within this many seconds of the next start
+GAP_THRESHOLD_SECS = 60
 
-RETRY_ATTEMPTS     = 6
-RETRY_BACKOFF_SECS = 30
+RETRY_ATTEMPTS     = 4
+RETRY_BACKOFF_SECS = 20
 
-# Headers that real browsers / other Rakuten clients send
 API_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -42,21 +41,21 @@ API_HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
 }
 
+# Values that have historically worked. 250 is now rejected.
+PER_PAGE_CANDIDATES = [100, 50, 20]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def remove_control_characters(s: str) -> str:
-    """Strip Unicode control characters from a string."""
     return "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
 
 
 def normalize(name: str) -> str:
-    """Lowercase + keep only alphanumerics for fuzzy channel matching."""
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
 def to_tz_str(val) -> str:
-    """Convert an epoch int/float or a datetime to a localised XMLTV timestamp."""
     if isinstance(val, datetime):
         dt = val if val.tzinfo else val.replace(tzinfo=timezone.utc)
     else:
@@ -65,50 +64,34 @@ def to_tz_str(val) -> str:
 
 
 def fetch_with_retry(url: str, headers: dict | None = None, timeout: int = 30) -> requests.Response:
-    """
-    GET a URL with automatic retry on 503 / connection errors.
-    On final failure (or non-retryable 4xx) logs the response body when available.
-    """
     last_exc = None
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             resp = requests.get(url, headers=headers or {}, timeout=timeout)
             if resp.status_code == 503 and attempt < RETRY_ATTEMPTS:
-                print(f"  [attempt {attempt}/{RETRY_ATTEMPTS}] 503 received, "
-                      f"retrying in {RETRY_BACKOFF_SECS}s ...")
+                print(f"  [attempt {attempt}/{RETRY_ATTEMPTS}] 503, retrying in {RETRY_BACKOFF_SECS}s ...")
                 time.sleep(RETRY_BACKOFF_SECS)
                 continue
-            # For 4xx we usually don't want endless retries – raise immediately
-            # so the caller can try a fallback strategy.
             if 400 <= resp.status_code < 500:
-                print(f"  HTTP {resp.status_code} body (first 500 chars): {resp.text[:500]!r}")
+                print(f"  HTTP {resp.status_code} body: {resp.text[:600]!r}")
                 resp.raise_for_status()
             resp.raise_for_status()
             return resp
         except requests.exceptions.RequestException as exc:
             last_exc = exc
-            if attempt < RETRY_ATTEMPTS and not (
-                hasattr(exc, "response") and exc.response is not None
-                and 400 <= exc.response.status_code < 500
-            ):
-                print(f"  [attempt {attempt}/{RETRY_ATTEMPTS}] Request error: {exc}, "
-                      f"retrying in {RETRY_BACKOFF_SECS}s ...")
-                time.sleep(RETRY_BACKOFF_SECS)
-            else:
-                # Final failure or non-retryable 4xx – stop early
+            # Don't keep retrying pure 4xx
+            if hasattr(exc, "response") and exc.response is not None and 400 <= exc.response.status_code < 500:
                 break
+            if attempt < RETRY_ATTEMPTS:
+                print(f"  [attempt {attempt}/{RETRY_ATTEMPTS}] {exc}, retrying in {RETRY_BACKOFF_SECS}s ...")
+                time.sleep(RETRY_BACKOFF_SECS)
     raise last_exc
 
 
 # ── EPG window ────────────────────────────────────────────────────────────────
 
 def get_epg_window(hours: int = 72):
-    """
-    Return (start, end) timezone-aware UTC datetimes.
-    Default = roughly 72-hour window starting at the current hour.
-    """
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    # End at the next midnight that is at least `hours` away
     end = (now + timedelta(hours=hours)).replace(hour=0, minute=0, second=0, microsecond=0)
     if end <= now:
         end += timedelta(days=1)
@@ -116,13 +99,6 @@ def get_epg_window(hours: int = 72):
 
 
 def check_m3u_freshness(text: str) -> None:
-    """
-    Compare a hash of the fetched M3U body against the hash stored from the
-    previous run (committed alongside epg.xml/playlist.m3u in the repo).
-    Logs whether apsattv's list actually changed since last run — apsattv
-    updates this list manually/irregularly, so this is just a freshness
-    signal in the Actions log, not a hard gate.
-    """
     current_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     previous_hash = None
     try:
@@ -145,14 +121,6 @@ def check_m3u_freshness(text: str) -> None:
 # ── M3U fetching & parsing ────────────────────────────────────────────────────
 
 def fetch_m3u(url: str):
-    """
-    Download and parse an M3U playlist.
-
-    Returns two lookup dicts:
-      by_name  — keyed by normalize(display_name)
-      by_slug  — keyed by the portion of tvg-id after 'RakutenTV-UK_'
-    Each value: { tvg_id, tvg_logo, group, name, url }
-    """
     print(f"Fetching M3U: {url}")
     resp = fetch_with_retry(url)
     check_m3u_freshness(resp.text)
@@ -205,13 +173,6 @@ def fetch_m3u(url: str):
 
 
 def match_m3u(ch_name: str, ch_id: str, by_name: dict, by_slug: dict):
-    """
-    Find the M3U entry for a Rakuten API channel.
-    Strategy order:
-      1. Exact normalised display-name match
-      2. tvg-id slug match
-      3. Substring match (last resort)
-    """
     norm = normalize(ch_name)
 
     if norm in by_name:
@@ -221,14 +182,12 @@ def match_m3u(ch_name: str, ch_id: str, by_name: dict, by_slug: dict):
     for key, entry in by_name.items():
         if norm in key or key in norm:
             return entry
-
     return None
 
 
-# ── XMLTV builder ─────────────────────────────────────────────────────────────
+# ── XMLTV / M3U builders (unchanged) ──────────────────────────────────────────
 
 def build_xmltv(channels: list, programmes: list) -> bytes:
-    """Serialise channels + programmes to a well-formed XMLTV byte string."""
     root = etree.Element("tv")
     root.set("generator-info-name", "rakuten-uk-epg")
     root.set("generator-info-url",  "https://github.com/BuddyChewChew/RakutenTV")
@@ -276,13 +235,10 @@ def build_xmltv(channels: list, programmes: list) -> bytes:
     return etree.tostring(root, pretty_print=True, encoding="utf-8")
 
 
-# ── M3U builder ───────────────────────────────────────────────────────────────
-
 EPG_URL = "https://raw.githubusercontent.com/BuddyChewChew/RakutenTV/main/epg.xml"
 
 
 def build_m3u(channels: list) -> str:
-    """Build an M3U playlist; skips channels without a matched stream URL."""
     lines     = [f'#EXTM3U url-tvg="{EPG_URL}"']
     matched   = 0
     unmatched = []
@@ -314,10 +270,10 @@ def build_m3u(channels: list) -> str:
     return "\n".join(lines) + "\n"
 
 
-# ── API helpers with fallbacks ────────────────────────────────────────────────
+# ── API helpers ───────────────────────────────────────────────────────────────
 
-def build_api_url(epg_start: datetime, epg_end: datetime, include_timestamps: bool = True) -> str:
-    """Build the live_channels query URL."""
+def build_api_url(epg_start, epg_end, per_page: int, page: int = 1,
+                  include_timestamps: bool = True) -> str:
     params = {
         "classification_id": "18",
         "device_identifier": "web",
@@ -329,51 +285,73 @@ def build_api_url(epg_start: datetime, epg_end: datetime, include_timestamps: bo
         "epg_starts_at": epg_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         "locale": "en",
         "market_code": "uk",
-        "per_page": "250",
+        "per_page": str(per_page),
+        "page": str(page),
     }
     if include_timestamps:
-        # Critical fix: send integers, not floats like 1787518800.0
         params["epg_ends_at_timestamp"] = str(int(epg_end.timestamp()))
         params["epg_starts_at_timestamp"] = str(int(epg_start.timestamp()))
 
     return "https://gizmo.rakuten.tv/v3/live_channels?" + urlencode(params)
 
 
+def fetch_one_page(epg_start, epg_end, per_page: int, page: int,
+                   include_timestamps: bool) -> list:
+    url = build_api_url(epg_start, epg_end, per_page, page, include_timestamps)
+    resp = fetch_with_retry(url, headers=API_HEADERS)
+    data = resp.json().get("data") or []
+    return data
+
+
 def fetch_epg_data() -> list:
     """
-    Try several strategies to obtain the live_channels payload.
-    Returns the list under data["data"].
+    Try different per_page values and window sizes until something works.
+    Also paginates so we still get the full channel list.
     """
     strategies = [
-        # 1. Full 72 h window + timestamps (the normal case)
         {"hours": 72, "timestamps": True,  "label": "72h + timestamps"},
-        # 2. Same window but omit the _timestamp parameters
         {"hours": 72, "timestamps": False, "label": "72h (dates only)"},
-        # 3. Shorter window
         {"hours": 48, "timestamps": True,  "label": "48h + timestamps"},
-        # 4. Even shorter + no timestamps
         {"hours": 24, "timestamps": False, "label": "24h (dates only)"},
     ]
 
     last_exc = None
-    for strat in strategies:
-        epg_start, epg_end = get_epg_window(hours=strat["hours"])
-        api_url = build_api_url(epg_start, epg_end, include_timestamps=strat["timestamps"])
-        print(f"\nTrying strategy: {strat['label']}")
-        print(f"  window: {epg_start.isoformat()} → {epg_end.isoformat()}")
-        try:
-            resp = fetch_with_retry(api_url, headers=API_HEADERS)
-            data = resp.json().get("data")
-            if not data:
-                raise ValueError("API returned empty 'data' array")
-            print(f"  ✓ Success — retrieved {len(data)} channels")
-            return data
-        except Exception as exc:
-            last_exc = exc
-            print(f"  ✗ Failed: {exc}")
-            continue
 
-    # All strategies exhausted
+    for strat in strategies:
+        for per_page in PER_PAGE_CANDIDATES:
+            epg_start, epg_end = get_epg_window(hours=strat["hours"])
+            print(f"\nTrying: {strat['label']}, per_page={per_page}")
+            print(f"  window: {epg_start.isoformat()} → {epg_end.isoformat()}")
+
+            try:
+                all_channels = []
+                page = 1
+                while True:
+                    chunk = fetch_one_page(
+                        epg_start, epg_end, per_page, page, strat["timestamps"]
+                    )
+                    if not chunk:
+                        break
+                    all_channels.extend(chunk)
+                    print(f"  page {page}: +{len(chunk)} channels (total {len(all_channels)})")
+                    # Stop when we receive fewer than requested (last page)
+                    if len(chunk) < per_page:
+                        break
+                    page += 1
+                    # Safety limit
+                    if page > 10:
+                        break
+
+                if all_channels:
+                    print(f"  ✓ Success — retrieved {len(all_channels)} channels")
+                    return all_channels
+                else:
+                    print("  empty data array")
+            except Exception as exc:
+                last_exc = exc
+                print(f"  ✗ Failed: {exc}")
+                continue
+
     raise RuntimeError(
         "All EPG fetch strategies failed. Last error: " + str(last_exc)
     ) from last_exc
@@ -382,10 +360,8 @@ def fetch_epg_data() -> list:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # 1. Fetch & parse M3U stream source
     m3u_by_name, m3u_by_slug = fetch_m3u(M3U_SOURCE)
 
-    # 2. Fetch EPG data (with fallbacks)
     print("\nFetching EPG data from Rakuten API ...")
     data = fetch_epg_data()
     print(f"\nRetrieved {len(data)} channels\n")
@@ -398,13 +374,11 @@ def main():
         ch_id   = channel["id"]
         print(f"  {ch_name}")
 
-        # Logo
         ch_icon = None
         if channel.get("images"):
-            imgs    = channel["images"]
+            imgs = channel["images"]
             ch_icon = imgs.get("artwork_negative") or imgs.get("artwork")
 
-        # Language & tags
         ch_language = ch_tags = None
         if channel.get("labels"):
             labels = channel["labels"]
@@ -413,9 +387,6 @@ def main():
                 ch_language = langs[0].get("id")
             ch_tags = labels.get("tags")
 
-        # Match to an M3U stream entry (used only for its stream URL — the
-        # apsattv tvg-id format is inconsistent across mirrors/refreshes and
-        # is NOT used as our channel identifier, see note below)
         m3u = match_m3u(ch_name, ch_id, m3u_by_name, m3u_by_slug)
 
         channels_data.append({
@@ -426,10 +397,6 @@ def main():
             "language":   ch_language,
             "tags":       ch_tags,
             "stream_url": m3u["url"] if m3u else None,
-            # IMPORTANT: always use Rakuten's own slug (e.g. "mr-bean-live-action")
-            # as tvg-id, NOT the source M3U's tvg-id. epg.xml's <channel id="...">
-            # is built from this same ch_id, so playlist.m3u and epg.xml must
-            # share this value or TiviMate can't match programmes to channels.
             "tvg_id":     ch_id,
             "tvg_logo":   m3u["tvg_logo"] if m3u else ch_icon,
             "group":      m3u["group"]    if m3u else "RakutenTV UK",
@@ -447,9 +414,8 @@ def main():
                 "tags":        ch_tags,
             })
 
-    # 3. Normalise programme end-times (close small gaps / remove overlaps)
+    # Normalise end times
     programme_data.sort(key=lambda p: (p["channel_id"], p["starts_at"]))
-
     by_channel = {}
     for p in programme_data:
         by_channel.setdefault(p["channel_id"], []).append(p)
@@ -462,7 +428,6 @@ def main():
             elif (nxt["starts_at"] - cur["ends_at"]).total_seconds() <= GAP_THRESHOLD_SECS:
                 cur["ends_at"] = nxt["starts_at"]
 
-    # 4. Write outputs
     with open("epg.xml", "wb") as f:
         f.write(build_xmltv(channels_data, programme_data))
     print("\nWrote epg.xml")
