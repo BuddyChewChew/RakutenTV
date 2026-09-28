@@ -20,7 +20,7 @@ from lxml import etree
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-M3U_SOURCE         = "https://www.apsattv.com/rakutentv-uk.m3u"
+M3U_SOURCE         = "https://www.apsattv.com/rakuten_uk.m3u"
 M3U_HASH_FILE      = ".m3u_source_hash"
 TIMEZONE           = pytz.timezone("Europe/London")
 DT_FORMAT          = "%Y%m%d%H%M%S %z"
